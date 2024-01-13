@@ -1,0 +1,1953 @@
+---
+title: "AML: Product affinity modeling by Weiping Zhang, FS23" 
+output:
+  html_document:
+    toc: yes
+    toc_depth: '4'
+    df_print: paged
+    toc_float: true
+  html_notebook:
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+    theme: united
+    highlight: tango
+    code_folding: hide
+---
+
+### SCOPE: find the potential important features for credit card selling, and rank the clients with the hightest probabilities
+
+I would like to analyze customer preferences and financial behaviors to understand the potential cross-selling opportunities. Finally, the prediction model can help the banks to identify good clients who may buy credit card and bad clients who are unlikely to pay the credits.
+
+
+```{r,message=FALSE}
+# Load the libraries
+library(tidymodels)
+library(tidyverse)
+library(dplyr)
+library(DataExplorer)
+library(ggplot2)
+library(lubridate)
+library(rlang)
+library(gridExtra)
+library(cowplot)
+library(caret)
+library("pROC")
+library(glmnet)
+library(Matrix)
+library(ROSE)
+library(randomForest)
+library(caret)
+library(ranger)
+library(DALEX) 
+library(DALEXtra)
+library(kknn)
+```
+
+
+## 1. Data preprocessing
+### 1.1 exploratory data analysis
+#### 1.1.1 load relevant dataset and check data quality
+
+```{r}
+account <- read.csv(file = 'data/account.csv',sep = ';')
+card <- read.csv(file = 'data/card.csv',sep = ';')
+client <- read.csv(file = 'data/client.csv',sep = ';')
+disp <- read.csv(file = 'data/disp.csv',sep = ';')
+district <- read.csv(file = 'data/district.csv',sep = ';')
+loan <- read.csv(file = 'data/loan.csv',sep = ';')
+order <- read.csv(file = 'data/order.csv',sep = ';')
+trans <- read.csv(file = 'data/trans.csv',sep = ';')
+```
+
+There are eight dataframes, I will observe them one after another to understand them.
+
+#### 1.1.2 understand and transform data
+##### 1.1.2.1 disposition: each record relates together a client with an account
+
+```{r}
+disp <- unique(disp)
+print(head(disp,3))
+```
+```{r}
+# function print_df_info will print some basic information of a dataframe
+print_df_info <- function(df) {
+  cat(dim(df)[1], "rows and", dim(df)[2], "columns\n")
+  cat("Data types:\n")
+  print(sapply(df, class))
+  cat("number of NAs in columns:\n")
+  cat("  ", colSums(is.na(df)), "\n", sep = "  ")
+  cat(sum(rowSums(is.na(df)) > 0), "rows contain missing values\n")
+
+  if (length(df) > 0) {
+    for (col in names(df)) {
+      if (is.numeric(df[[col]])) {
+        cat("\nColumn", col, "\n")
+        print(summary(df[[col]]))
+      } else if (is.character(df[[col]])) {
+        cat("\nColumn", col, "unique Values:\n")
+        unique_values <- unique(df[[col]])
+        cat("  ", paste(unique_values, collapse = ", "), "\n")
+      }}} else {cat("No data in this dataframe.\n")}}
+
+print_df_info(disp)
+```
+
+There are no NAs or blank cells. Data types are correct.
+
+```{r}
+# generate a function to check relationship between two variables
+check_relationship <- function(dataframe, column1, column2) {
+  if (all(table(dataframe[[column1]]) == 1) && all(table(dataframe[[column2]]) == 1)) {
+    cat("The relationship between", column1, "and", column2, "is one-to-one.\n")
+  } else if (any(table(dataframe[[column1]]) > 1) && all(table(dataframe[[column2]]) == 1)) {
+    cat("The relationship between", column1, "and", column2, "is one-to-many.\n")
+  } else if (all(table(dataframe[[column1]]) == 1) && any(table(dataframe[[column2]]) > 1)) {
+    cat("The relationship between", column1, "and", column2, "is many-to-one.\n")
+  } else {
+    cat("The relationship between", column1, "and", column2, "is neither one-to-one, one-to-many, nor many-to-one.\n")
+  }}
+
+check_relationship(disp, "account_id", "disp_id")
+check_relationship(disp, "client_id", "disp_id")
+```
+
+
+##### 1.1.2.2 card: each record describes a credit card issued to an account
+
+```{r}
+card <- unique(card)
+print(head(card,3))
+```
+```{r}
+# check the data information and quality
+print_df_info(card[,1:3])
+```
+
+```{r}
+# remove junior credit card customers, because of the specific goals and strategies of the bank
+card <- card %>% filter(type != 'junior') 
+# Transform 'issued' to a Date type
+card$issued <- as.Date(card$issued, format = '%y%m%d')
+# rename columns
+colnames(card)[3:4] <- c("card_type","card_issued")
+print(head(card,3))
+```
+
+```{r}
+check_relationship(card, "card_id", "disp_id")
+```
+
+
+##### 1.1.2.3 district: each record describes demographic characteristics of a district
+```{r}
+district <- unique(district)
+print(head(district,3))
+```
+
+```{r}
+# add column names
+colnames(district) <- c("district_id","district_name","region","nr_inhabitants","nr_municipalities_1","nr_municipalities_2","nr_municipalities_3","nr_municipalities_4","nr_cities","ratio_urban_inhabitants","average_salary", "unemploy_rate_95","unemploy_rate_96","nr_enterpreneurs_per_1000_inhabitants","nr_commited_crimes_95", "nr_commited_crimes_96")
+print(head(district,3))
+```
+```{r}
+print_df_info(district)
+```
+
+The data types of columns unemploy_rate_95 and nr_commited_crimes_95 were incorrect. 
+Convert them from categorical to numeric type.
+The two columns contain also '?' character, they should be replaced with NA
+
+```{r}
+# replace "?" with NA
+district$unemploy_rate_95[district$unemploy_rate_95 == "?"] <- NA
+district$nr_commited_crimes_95[district$nr_commited_crimes_95 == "?"] <- NA
+# transfomr data type to numeric
+district$unemploy_rate_95 <- as.numeric(district$unemploy_rate_95)
+district$nr_commited_crimes_95 <- as.numeric(district$nr_commited_crimes_95)
+```
+
+Now, I have to deal with the NAs in these two columns. According to my observation, using the ratio between unemploy_rate_95 and unemploy_rate_96 may be a good idea for NA imputation in column unemploy_rate_95. Use same strategy for the nr_commited_crimes_95.
+
+First, calculate the ratios and check how they distributed.
+
+```{r}
+unemploy_ratio <- district$unemploy_rate_95 / district$unemploy_rate_96
+crimes_ratio <- district$nr_commited_crimes_95 / district$nr_commited_crimes_96
+
+p_unemploy <- ggplot(data.frame(unemploy_ratio = unemploy_ratio), aes(x = unemploy_ratio)) +
+  geom_histogram(bins = 10, fill = "skyblue") +
+  labs(
+    main = "",
+    x = "Ratio (unemploy_rate_95 / unemploy_rate_96)",
+    y = "Frequency") + theme_minimal()
+p_crime <- ggplot(data.frame(crimes_ratio = crimes_ratio), aes(x = crimes_ratio)) +
+  geom_histogram(bins = 10, fill = "skyblue") +
+  labs(
+    main = "",
+    x = "Ratio (nr_commited_crimes_95 / nr_commited_crimes_96)",
+    y = "Frequency") + theme_minimal()
+grid.arrange(p_unemploy, p_crime, ncol=1)
+```
+Ratio of unemploy_rate:
+It is slightly left skewed distributed. However, the distribution is from only 77 values. The ratio values mostly are between 0.7 and 0.9. I will use the median value of the ratio to impute the NAs in unemploy_rate_95 column.
+
+Ratio of commited_crimes:
+It is light right-skewed distributed, with values mostly between 0.9 and 1.1. 
+
+I will use the median values of ratio to impute NAs.
+```{r}
+# Impute NAs in unemploy_rate_95
+district$unemploy_rate_95[is.na(district$unemploy_rate_95)] <- district$unemploy_rate_96[is.na(district$unemploy_rate_95)] * median(unemploy_ratio, na.rm = TRUE)
+# Impute NAs in nr_commited_crimes_95
+district$nr_commited_crimes_95[is.na(district$nr_commited_crimes_95)] <- district$nr_commited_crimes_96[is.na(district$nr_commited_crimes_95)] * median(crimes_ratio, na.rm = TRUE)
+cat("Number of NAs in each column:",colSums(is.na(district)))
+```
+
+
+
+##### 1.1.2.4 client:each record describes characteristics of a client
+```{r}
+client <- unique(client)
+print(head(client,3))
+```
+```{r}
+# check data quality
+print_df_info(client)
+```
+
+
+- the birth_number column in dataframe client represents for client's birthday. this should be transformed to date type
+- the birth_number with YYMM+50DD is for woman, so here could add a new column 'gender'
+
+```{r}
+client <- client %>%
+  mutate(
+    mid_two_digits = as.numeric(substr(birth_number, 3, 4)),
+    gender = ifelse(mid_two_digits > 50, "female", "male"), # add gender
+    birth_number_ = ifelse(mid_two_digits > 50, birth_number - 5000, birth_number), 
+    birthday = as.Date(paste0("19", birth_number_), format = "%Y%m%d")) # add birthday as date type
+# check if the wangling is correct
+print(head(client, n = 5))
+```
+```{r}
+# it seems correct, now drop the irrelavant columns
+client <- client %>% select(-c(mid_two_digits,birth_number,birth_number_))
+head(client, n = 3)
+```
+
+```{r}
+check_relationship(client, "client_id", "district_id")
+```
+
+
+##### 1.1.2.5 account: each record describes static characteristics of an account
+
+```{r}
+account <- unique(account)
+account[account == ""] <- NA
+print(head(account,3))
+```
+
+```{r}
+# inspect data quality
+print_df_info(account)
+```
+- 'date' column should be transformed to date type
+
+```{r}
+# convert the 'date' column to Date format, rename
+account$account_date <- ymd(account$date + 19000000)
+account <- subset(account, select = -date)
+colnames(account)[3] <- "account_freq"
+print(head(account,3))
+```
+```{r}
+check_relationship(account, "account_id", "district_id")
+```
+
+##### 1.1.2.6 loan: each record describes a loan granted for a given account
+
+```{r}
+loan <- unique(loan)
+print(head(loan,3))
+```
+
+```{r}
+# inspect data quality
+print_df_info(loan)
+```
+
+'date' column should be transformed to date type
+
+```{r}
+# convert the 'date' column to Date format, rename
+loan$loan_date <- ymd(loan$date + 19000000)
+loan <- subset(loan, select = -date)
+colnames(loan)[3:6] <- c("loan_amount", "loan_duration", "loan_payments","loan_status")
+print(head(loan,3))
+```
+```{r}
+check_relationship(loan, "loan_id", "account_id")
+```
+
+##### 1.1.2.7 order: each record describes characteristics of a payment order
+
+```{r}
+# drop duplicates, replace blank cells with NA
+order <- unique(order)
+order[order == ""] <- NA
+print(head(order,3))
+```
+
+```{r}
+# inspect data quality
+print_df_info(order)
+```
+There are blank cells in column k_symbol, should be replaced with NA.
+
+In this data, k_symbol and amount are two important features. k_symbol stands for the payment types:
+    - "POJISTNE" stands for insurrance payment
+    - "SIPO" stands for household
+    - "LEASING" stands for leasing
+    - "UVER" stands for loan payment
+
+So I will drop the columns which are probably irrelevant to the project: order_id, bank_to, account_to.
+
+```{r}
+order$k_symbol[order$k_symbol == " "] <- NA
+order <- order %>% select(-c(order_id, bank_to, account_to))
+check_relationship(order, "account_id", "order_id")
+```
+```{r}
+print(head(order,3))
+```
+convert to a wide table, so that there is only one observation per account_id 
+```{r, echo=FALSE, message=FALSE}
+# replace the NA as 'OTHER' k_symbol
+order$k_symbol[is.na(order$k_symbol)] <- "OTHER"
+# long to wide
+order <- order %>% group_by(account_id, k_symbol) %>% summarise(total_amount = sum(amount)) %>%
+  pivot_wider(names_from = k_symbol, values_from = total_amount, values_fill = 0)
+# generate column 'TOTAL' which is the sum of other columns
+order$TOTAL <- rowSums(order[, 2:6], na.rm = TRUE)
+names(order)[-1] <- paste0("order_", names(order)[-1])
+print(head(order,3))
+```
+
+
+##### 1.1.2.8 trans: each record describes one transaction on an account
+```{r}
+# drop duplicates
+trans <- unique(trans)
+print(head(trans,3))
+```
+
+```{r}
+# inspect data quality
+print_df_info(trans)
+```
+
+Following problems need to be solved:
+  - Datatype of 'date' need to changed from integer to date type.
+  - There are many NAs.
+  - 'type' column should be either 'PRIJEM' or 'VYDAJ' values based on the reference. How should deal with 'VYBER'. 
+  - 'operation', 'k_symbol', 'bank', 'account' columns have blank cells.
+
+
+```{r}
+# 'date' column should be transformed to date type.
+trans$trans_date <- ymd(trans$date + 19000000)
+trans <- subset(trans, select = -date)
+
+# replace "" and " " with NA
+trans[trans == ""] <- NA
+trans$k_symbol[trans$k_symbol == " "] <- NA
+print(head(trans,3))
+```
+```{r}
+na_counts <- colSums(is.na(trans))
+na_proportions <- na_counts / nrow(trans)
+
+barplot(na_proportions, names.arg = names(na_proportions), col = "skyblue", 
+        main = "Proportion of NA Values by Column", ylab = "Proportion")
+```
+
+
+There are NAs in columns operation (around 19% NAs), k_symbol (around 50% NAs), bank (around 78% NAs), account (around 76% NAs).
+Now let's understand the meaning of the columns and how to deal with the NA data (impute NA or drop them).
+
+'opertion' column: stores the mode of transaction. "VYBER KARTOU" credit card withdrawal; "VKLAD" credit in cash; "PREVOD Z UCTU" collection from another bank; "VYBER" withdrawal in cash; "PREVOD NA UCET" remittance to another bank.
+
+'k_symbol' column: characterization of the transaction. "POJISTNE" stands for insurrance payment; "SLUZBY" stands for payment for statement; "UROK" stands for interest credited; "SANKC. UROK" sanction interest if negative balance; "SIPO" stands for household; "DUCHOD" stands for old-age pension; "UVER" stands for loan payment. 
+
+'bank' column: bank of the partner.
+
+'account' column: account of the partner.
+
+It seems, the content of k_symbo, bank, account are dependent on the operation type. check how they are related.
+```{r}
+# count the NA by operation type
+trans %>% group_by(operation) %>%
+  summarise(
+    Total_Count = n(),
+    NA_count_k = sum(is.na(k_symbol)),
+    NA_count_bank = sum(is.na(bank)),
+    NA_count_account = sum(is.na(account))) %>% print()
+```
+From the upper table, we could see that: 
+  - though there are 183114 NAs in column operation. But in these 183114 rows, the k_symbol column values are all available , bank and account columns are all NAs.
+  - VYBER KARTOU operation has only 'account' information available.
+  - PREVOD Z UCTU and PREVOD NA UCET operations have almost no NAs in bank and account columns.
+  - YKLAD operation has no available k_symbol, bank, account information.
+  
+My understanding is: 
+  - The availability of columns 'bank' and 'account' is largely dependent on 'operation' type. This indicates that these two columns may not provide meaningful information across all 'operation' types.
+  - In addition, over 75% of these two columns are not available. This indicates that imputing the missing values might not provide accurate results.
+  - So I will drop the columns 'bank' and 'account'.
+  
+```{r}
+trans <- subset(trans, select = -c(bank, account))
+```
+
+How should I deal with column k_symbol?
+First check the relationship between operation and k_symbol.
+```{r, echo=FALSE, message=FALSE}
+trans %>%group_by(operation, k_symbol) %>% summarise(Count = n()) %>% print()
+```
+The columns 'operation' and 'k_symbol' have 14 unique combinations. All combinations seem reasonable and with large count (except VYBER-POJISTNE). However, there is not enough information to impute the NAs in the two columns. So I will bind the two columns as one variable (trans_detail) to solve the NA issue 
+
+```{r}
+trans <- trans %>% mutate(operation = ifelse(is.na(operation), ' ', operation),  # replace NAs as blank before binding
+         k_symbol = ifelse(is.na(k_symbol), ' ', k_symbol),
+         trans_detail = paste(operation, k_symbol, sep = "-")) %>%
+  select(-operation, -k_symbol) 
+print(head(trans,3))
+```
+
+Now I would check the data which were incorrectly labeled as 'VYBER'.
+```{r, echo=FALSE, message=FALSE}
+trans %>%group_by(type, trans_detail) %>% summarise(Count = n())  %>% print()
+```
+All rows with 'type' of 'VYBER' have 'trans_detail' of 'VYBER-' (withdrawal in cash). All other rows which are labeled as 'trans_detail' of 'VYBER-' have the 'type' of 'VYDAJ' (withdrawal), which makes totally sense. I will replace all the incorrectly labeled 'VYBER' in column 'type' with 'VYDAJ'.
+```{r}
+trans <- trans %>%
+  mutate(type = ifelse(type == 'VYBER', 'VYDAJ', type))
+print(head(trans,3))
+```
+The amount column in the transaction data is absolute transaction values, this means, deposits (positive) and withdrawals (negative) transactions will all be shown as positive. Absolute transaction amount reflects the total financial flow, and could be useful for assessing an client's overall financial activity. However, it can not capture the transaction direction.
+So additionally, I will also introduce the real amount variable (including '+/-') to understand savings or spending patterns of clients. The identification is based on the balance (increased/decreased after adding/minusing a transaction):
+
+```{r}
+trans <- trans %>%
+  group_by(account_id) %>% arrange(account_id, trans_date) %>%
+  mutate(difference = balance - lag(balance, default = first(balance)),
+    `amount(+/-)` = ifelse(difference > 0, amount, amount * -1)) %>% select(-difference)
+print(head(trans,3))
+```
+
+```{r}
+check_relationship(trans, "account_id", "trans_id")
+```
+
+
+### 1.2 Join all dataframes to combine customers information and banking services.
+
+Before joining all dataframes, I would like to summarize some important relationships.
+- account_id and district_id: many-to-one
+- account_id and client_id: one-to-many
+- account_id and trans_id: one-to-many
+- account_id and order_id: one-to-many
+- account_id and loan_id: one-to-one
+- account_id and disp_id: one-to-many
+- client_id and disp_id: one-to-one
+- client_id and district_id: many-to-one
+- card_id and disp_id is one-to-one
+
+
+```{r}
+# First join the dataframes disposition, card, client, district, account, order.
+df1 <- disp %>% left_join(card, by = "disp_id", suffix = c("_disp","_card")) %>% select(-c(card_id,disp_id)) %>% 
+  left_join(client,by = "client_id",suffix = c("_card","_client"))  %>% left_join(district, by = "district_id") %>% select(-district_id) %>% left_join(account, by = "account_id") %>% select(-district_id) %>% left_join(order, by = "account_id") %>% left_join(loan, by = 'account_id', suffix = c("_account","_loan"))
+print(head(df1,3))
+```
+
+
+It worth noting that only owner can issue permanent orders and ask for a loan. This means, the loan dataframe should be joined only to 'OWNER'. And I will drop the 'DISPONENT' type client, only keep the 'OWNER' type client. To keep the information 'how many clients does an account have", I will generate a new column 'n_clients' to represent it. 
+
+```{r}
+df1 <- df1 %>% group_by(account_id) %>% mutate(n_clients = n())
+
+barplot(table(df1$n_clients), 
+        names.arg = names(table(df1$n_clients)), 
+        xlab = "Number of Clients per Account", ylab = "Count", main = "Distribution: Number of Clients per Account ")
+```
+The plot shows that, around 3700 account_id has only one client (OWNER), around 1800 account has two client (1 OWNER and 1 DISPONENT).
+
+```{r}
+# check if it is true that DISPONENT clients have no credit cards.
+df1 %>% group_by(type) %>% summarize(count_card = sum(!is.na(card_type))) %>% print()
+```
+The result comfirmed my assumption: DISPONENT clients have no credit cards. Only OWNER clients could be issued credit cards. So I will drop all 'DISPONENT' clients rows. Afterwards the column type_disp will only contain one type 'OWNER', this means it is not anymore helpful for further analysis. So I will also drop the whole column type_disp.
+
+```{r}
+df1 <- subset(df1, type != "DISPONENT") %>% select(-type,client_id,loan_id)
+```
+
+Age is often an important factor in financial capacity analysis. I would add two variables 'card_age' and 'loan_age' to represent the client age when the card was issued, and the loan was issued.
+
+```{r}
+df1$card_age <- as.numeric(difftime(df1$card_issued, df1$birthday, units = "days") / 365)
+df1$loan_age <- as.numeric(difftime(df1$loan_date, df1$birthday, units = "days") / 365)
+print(head(df1,3))
+```
+ 
+
+### 1.3 Identification of existing credit card buyers 
+This includes determination of purchase date and rollup window, defined by 1 month lag and 12 months history before credit card purchase.
+
+Identify the existing credit card buyers:
+```{r}
+buyers <- subset(df1, !is.na(card_type)) %>% select(c(account_id,card_type,card_issued))
+nonbuyers<- subset(df1, is.na(card_type)) %>% select(c(account_id,card_type,card_issued))
+cat("Number of Buyers:", nrow(buyers), "\n")
+cat("Number of Non-Buyers:", nrow(nonbuyers), "\n")
+cat("Ratio of Non-Buyers to Buyers:", round(nrow(nonbuyers)/nrow(buyers),1), "\n")
+```
+```{r}
+# Create a vector of values
+barplot(c(nrow(buyers), nrow(nonbuyers)), names.arg = c("Credit Card Buyers", "Credit Card Non-Buyers"), ylab = "Count")
+```
+
+```{r}
+ggplot(buyers, aes(x = card_issued)) +
+  geom_density(fill = "blue", alpha = 0.7) +  # Density plot
+  labs(x = "Issued Date", y = "Density", title = "Distribution of Credit Card Issued Date") +
+  theme_minimal()
+```
+There is a stable increase of credit cards purchase between 1994 and 1996. 
+since 1996, the growth was rapid and reached the peak density between 1998 and 1999, indicating the period of highest credit card issuance activity.
+
+
+
+In the whole dataset, 747 clients have already bought the credit cards, 3753 clients have not purchased credit cards. The ratio of 5 means there are approximately 5 times "nonbuyers" as "buyers" in the 'card_type' column. Dataset is severe imbalanced. For the further machine learning modelling, sampling methods (e.g. oversampling, undersampling ...) or suitable evaluation metrics for imbalanced data (e.g. f1 score) must be considered. 
+
+```{r, echo=FALSE, message=FALSE}
+buyers_trans <- buyers %>% left_join(trans,by='account_id')
+buyers_trans$months_difference <- as.integer(difftime( buyers_trans$trans_date,buyers_trans$card_issued, units = "days") / 30.44) - 1
+# keep the 24 months history before credit card purchase, as needed for rollup windows.
+buyers_trans <- buyers_trans %>% filter(months_difference < 0 & months_difference >= -24)
+# calculate the total transaction amount within each month, and rollup windows with size = 12 to avoid the seasonal factors
+window_size <- 12
+buyers_trans_hist <- buyers_trans %>% group_by(account_id, months_difference) %>% summarise(monthly_trans= sum(amount)) %>% group_by(account_id) %>% arrange(account_id, months_difference) %>%
+  mutate(roll_monthly_trans = sapply(seq_along(monthly_trans), function(i) mean(monthly_trans[max(1, i - window_size + 1):i]))) %>%
+  ungroup() %>% filter(months_difference >= -12)
+print(head(buyers_trans_hist))
+```
+
+
+We could see that a slow growth of the average monthly transaction in the first 11 months. In the last month, it increased rapidly from around 58000 to 117000. To further understand if the tendency is affected by outliers and skewed distribution, I will also check the median, upper- and lower-quartiles tendency.
+
+
+```{r}
+# Define a function to calculate and plot statistics 
+calculate_and_plot_stats <- function(df,col,y_label,title,a,b) {
+  # Calculate mean, median, upper quartile, and lower quartile
+  stats <- df %>%
+    group_by(months_difference) %>%
+    summarize(
+      mean_amount = mean(!!sym(col), na.rm = TRUE),
+      median_amount = median(!!sym(col), na.rm = TRUE),
+      upper_quartile_amount = quantile(!!sym(col), probs = 0.75, na.rm = TRUE),
+      lower_quartile_amount = quantile(!!sym(col), probs = 0.25, na.rm = TRUE))
+  
+  # Create a data frame for labels
+  label_df <- data.frame(
+    months_difference = -4,
+    label = c("Mean","Median", "Upper Quartile", "Lower Quartile"),
+    y = c(
+      stats$mean_amount[stats$months_difference == -2][1],
+      stats$median_amount[stats$months_difference == -2][1],
+      stats$upper_quartile_amount[stats$months_difference == -2][1],
+      stats$lower_quartile_amount[stats$months_difference == -2][1]))
+  
+  # Create a line plot
+  ggplot(stats, aes(x = months_difference)) +
+    geom_line(aes(y = mean_amount), color = "black", linetype = "solid") +
+    geom_line(aes(y = median_amount), color = "blue", linetype = "solid") +
+    geom_line(aes(y = upper_quartile_amount), color = "red", linetype = "solid") +
+    geom_line(aes(y = lower_quartile_amount), color = "green", linetype = "solid") +
+    scale_x_continuous(breaks = -12:-1) +
+    labs(
+      x = "Month",
+      y = y_label,
+      title = title) +
+    geom_text(data = label_df, aes(label = label, x = months_difference, y = y), size = 3.5, vjust = -0.5, hjust = 0.5, color = c("black","blue", "red", "green")) +
+    theme_minimal() +
+    scale_y_continuous(limits = c(a, b)) + 
+    theme(
+    axis.title = element_text(size = 10),   # Adjust the axis label text size
+    plot.title = element_text(size = 12, hjust = 0.5))}
+
+
+plot1 = calculate_and_plot_stats(buyers_trans_hist, "roll_monthly_trans", "Monthly Transaction", "Credit Card Buyers",8000,85000)
+plot1
+```
+
+
+The median, upper quartile, lower quartile lines show very similar tendency as the average transaction amount. But the median line is consistently lower than the average line. This means the data is left (negative) skewed distributed. In this case, it is more reasonable to use median to measure the tendency.
+
+
+### 1.4 Determination of non-buyers for comparison (incl. roll-up window).
+
+```{r, echo=FALSE, message=FALSE}
+nonbuyers_trans <- trans %>% inner_join(nonbuyers, by = "account_id")
+nonbuyers_trans <- nonbuyers_trans %>%
+  group_by(account_id) %>%
+  arrange(account_id, desc(trans_date)) %>%
+  mutate(latest_date = first(trans_date)) %>%
+  filter(trans_date >= (latest_date - months(24))) %>% ungroup() %>% 
+  mutate( months_difference = as.integer(difftime( trans_date,latest_date, units = "days") / 30.44) - 1)
+
+# calculate the total transaction amount within each month
+nonbuyers_trans_hist <- nonbuyers_trans %>% group_by(account_id, months_difference) %>% summarise(monthly_trans = sum(amount)) %>%
+  group_by(account_id) %>%
+  arrange(account_id, months_difference) %>%
+  mutate(roll_monthly_trans = sapply(seq_along(monthly_trans), function(i) mean(monthly_trans[max(1, i - window_size + 1):i]))) %>%
+  ungroup() %>% filter(months_difference >= -12)
+print(head(nonbuyers_trans_hist))
+```
+
+```{r}
+plot2 = calculate_and_plot_stats(nonbuyers_trans_hist, "roll_monthly_trans", " ", " Credit Card Non-Buyers",8000,85000)
+common_title <- ggdraw() + draw_label("12 Months Rollup Transaction History", fontface='bold', size = 14)
+bottom_row <- plot_grid(plot1, plot2, ncol = 2)
+plot_grid(common_title, bottom_row, nrow = 2, rel_heights = c(0.2, 1))
+```
+
+
+
+Analysis of non-buyers: All four statistics lines have very similar tendency, where median is constantly lower than mean, this indicates the data is negative (left) skewed distributed. In such case, median is more robust than mean to represent the data.
+non-buyers transaction tendency of the last 12 months is relatively stable with a peak at seventh month. The amount of 12th month and last month are obviously higher than the other months. 
+
+
+
+Summary based on the comparison of transaction rollup windows Buyers VS non-Buyers: 
+- the monthly transaction amount of buyers (median: around 40,000 - 95,000) is much larger than the nonbuyers (median: around 18,000 - 29,000).
+- buyers and non-buyers have differently tendency over the last 12 months before credit card purchase. This means, transaction amount related features may be important to classify credit card buyers and non-buyers. For machine learning modeling, I will include comprehensive client-specific statistical feature engineering for the transaction amount.
+- both dataset are imbalanced, balancing methods or evaluation metrics for imbalanced data must be considered.
+
+
+
+### 1.5 Constructing the assets and turnovers in the rollup window based on the transaction history.
+
+Based on the data we have, asset could be calculated like this: asset = balance - loan (if the account has loan). Of course, I should consider how much loan has already been paid for the time point of asset calculation. The "UVER" k_symbol in transaction stands for loan payment. With this we could calculate the remaining loan for each observations in transaction data.
+
+  
+```{r}
+trans_loan <- trans %>% left_join(loan, by = "account_id", suffix = c("_trans","_loan")) 
+colnames(trans_loan)[4] <- "trans_amount"
+
+# split the transaction loan data into two parts
+# part 1: the account had loan from the bank; here asset = balance - remaining loan
+trans_loan_1 <- trans_loan %>%
+  filter(trans_date >= loan_date) %>%
+  arrange(account_id, trans_date) %>%
+  group_by(account_id) %>% mutate(
+    paid_loan = ifelse(grepl("UVER", trans_detail, ignore.case = TRUE), trans_amount, 0), # amount of paid loan in each transaction
+    accum_paid_loan = cumsum(paid_loan), # accumulated paid loan
+    remaining_loan = loan_amount - accum_paid_loan, # remaining loan
+    remaining_loan = ifelse(remaining_loan < 0, 0, remaining_loan), # replace negative remaining loan as 0, this means loan is totally paid.
+    asset = balance - remaining_loan) %>% ungroup() %>% select(-c(loan_id,paid_loan,accum_paid_loan,remaining_loan)) # asset 
+# part 2: the account which has never been issued a loan, and the account before loan is issued.
+trans_loan_2 <- trans_loan %>% filter(trans_date < loan_date | is.na(loan_date)) %>% mutate(asset = balance) %>% select(-loan_id)
+trans_loan <- rbind(trans_loan_1, trans_loan_2) 
+print(head(trans_loan,5))
+```
+
+
+Now, I will join the asset data to the transaction data of buyers and non-buyers 
+
+```{r}
+buyers_trans <- buyers_trans %>% left_join(trans_loan[, c("trans_id", "asset")], by = 'trans_id')
+nonbuyers_trans <- nonbuyers_trans %>% left_join(trans_loan[, c("trans_id", "asset")], by = 'trans_id')
+print(head(buyers_trans,5))
+```
+
+construct the assets using 12-month rollup window
+After each transaction, the asset of an accout get updated, this means each account contains many asset records. In this case it makes more sense to use average asset within a month to represent the monthly asset.
+
+
+```{r, echo=FALSE, message=FALSE}
+buyers_asset_hist <- buyers_trans %>% group_by(account_id, months_difference) %>% summarise(monthly_asset= mean(amount)) %>% group_by(account_id) %>% arrange(account_id, months_difference) %>%
+  mutate(roll_monthly_asset = sapply(seq_along(monthly_asset), function(i) mean(monthly_asset[max(1, i - window_size + 1):i]))) %>%
+  ungroup() %>% filter(months_difference >= -12)
+# do the same for the nonbuyers
+nonbuyers_asset_hist <- nonbuyers_trans %>% group_by(account_id, months_difference) %>% summarise(monthly_asset= mean(amount)) %>% group_by(account_id) %>% arrange(account_id, months_difference) %>%
+  mutate(roll_monthly_asset = sapply(seq_along(monthly_asset), function(i) mean(monthly_asset[max(1, i - window_size + 1):i]))) %>%
+  ungroup() %>% filter(months_difference >= -12)
+print(head(buyers_asset_hist))
+```
+
+```{r}
+plot3 = calculate_and_plot_stats(buyers_asset_hist, "roll_monthly_asset", "Monthly Asset", "Credit Card Buyers",2000,12000)
+plot4 = calculate_and_plot_stats(nonbuyers_asset_hist, "roll_monthly_asset", " ", "Credit Card Non-Buyers",2000,12000)
+
+common_title <- ggdraw() + draw_label("12 Months Rollup Asset History", fontface='bold', size = 14)
+bottom_row <- plot_grid(plot3, plot4, ncol = 2)
+plot_grid(common_title, bottom_row, nrow = 2, rel_heights = c(0.2, 1))
+```
+
+
+Compare Asset rollup history of buyers and non-buyers:
+- The buyers have significant higher asset (median: around 8300) than the nonbuyers (median: 4900 - 5500)
+- The asset of buyers is slightly increased over the 12 months, in contrast, the nonbuyers' asset amount is decreasing overtime.
+- This means, the asset (slope, mean, median, quartiles) could be an important feature for identifying buyers and nonbuyers. 
+
+### 1.6 Deriving customer-specific, statistical key figures for assets and sales in the rollup window using functions.
+
+statistical feature engineering
+```{r, echo=FALSE, message=FALSE}
+library(MASS)
+stat_features <- function(df, col, suffix) {
+# define a function to calculate mean, median, upper quartile, lower quartile, min, max,
+  stats <- df %>%
+    group_by(account_id) %>%
+    summarize(
+      !!paste0("mean_", suffix) := mean(!!sym(col), na.rm = TRUE),
+      !!paste0("median_", suffix) := median(!!sym(col), na.rm = TRUE),
+      !!paste0("upper_quartile_", suffix) := quantile(!!sym(col), probs = 0.75, na.rm = TRUE),
+      !!paste0("lower_quartile_", suffix) := quantile(!!sym(col), probs = 0.25, na.rm = TRUE),
+      !!paste0("min_", suffix) := min(!!sym(col), na.rm = TRUE),
+      !!paste0("max_", suffix) := max(!!sym(col), na.rm = TRUE),
+      !!paste0("var_", suffix) := var(!!sym(col), na.rm = TRUE),
+      !!paste0("std_", suffix) := sd(!!sym(col), na.rm = TRUE),
+      !!paste0("n_pos_changes_", suffix) := sum(diff(!!sym(col)) > 0),
+      !!paste0("n_neg_changes_", suffix) := sum(diff(!!sym(col)) < 0),
+      !!paste0("mad_", suffix) := mad(!!sym(col), na.rm = TRUE),
+      !!paste0("sad_", suffix) := sum(abs(diff(!!sym(col)))), # sum of absolute differences
+      !!paste0("n_above_mean_", suffix) := sum(!!sym(col) > mean(!!sym(col), na.rm = TRUE)),
+      !!paste0("n_below_mean_", suffix) := sum(!!sym(col) < mean(!!sym(col), na.rm = TRUE)),
+      !!paste0("slope_", suffix) := coef(lm(!!sym(col) ~ seq_along(!!sym(col))))[2], # coefficient of linear regression model
+      !!paste0("robust_trend_", suffix) := coef(rlm(!!sym(col) ~ seq_along(!!sym(col))))[2]) # coefficient of robust linear regression
+   
+  return(stats)}
+
+# statistical rollup transaction of buyers and non-buyers
+buyers_trans_stats = stat_features(buyers_trans_hist,"roll_monthly_trans","trans")
+nonbuyers_trans_stats = stat_features(nonbuyers_trans_hist,"roll_monthly_trans","trans")
+trans_stats <- rbind(buyers_trans_stats, nonbuyers_trans_stats)
+# statistical rollup asset of buyers and non-buyers
+buyers_asset_stats = stat_features(buyers_asset_hist,"roll_monthly_asset","asset")
+nonbuyers_asset_stats = stat_features(nonbuyers_asset_hist,"roll_monthly_asset","asset")
+asset_stats <- rbind(buyers_asset_stats, nonbuyers_asset_stats)
+print(head(trans_stats,3))
+```
+
+```{r, echo=FALSE, message=FALSE}
+# detach library MASS, as it generates conflicts with other libraries.
+detach("package:MASS", unload = TRUE) 
+print(head(asset_stats,3))
+```
+
+```{r}
+# join the statistical features to the other data by account_id
+df <- df1 %>% left_join(trans_stats, by = 'account_id') %>% left_join(asset_stats, by = 'account_id')
+print(head(df,3))
+```
+```{r}
+# check again if one account_id has only one data point.
+df_count <- df %>% group_by(account_id) %>% summarize(row_count = n())
+if (any(df_count$row_count > 1)) {print("Some account_id values have more than one row.")} else {print("Each account_id has only one row.")}
+```
+```{r}
+cat("Number of Rows:", dim(df)[1], "\n")
+cat("Number of Columns:", dim(df)[2], "\n")
+cat("Total Number of NAs in the DataFrame:", sum(colSums(is.na(df))), "\n")
+```
+
+
+### 1.7 Cleaning up unnecessary information and checking the structure of the modeling data 
+
+- Loan informations are only available for the accounts which have been issued loan. For the accounts without loan, NAs in these varialbes can not be filled. So I will generate a new column 'loan_issuance' to represent if an account has been issued loan, afterwards drop the other irrelavant loan variables.
+- Similarly, card relevant information is only available for card buyers, so I will also drop columns card_issued, card_age. The content of card_type should be changed to buyers (classic, gold) and nonbuyers (NA).
+- drop account_id or client_id, because client_id and account_id are one-to-one related, client_id is important for identifying the top-N important clients in later part. So I will drop account_id.
+- add the ages of clients in 1999-1-1 and ages of accounts (as the task was established), afterwards drop birthday, account_date. 
+```{r}
+df <- df %>%
+  mutate(
+    loan_issuance = ifelse(is.na(loan_id), "No", "Yes"),
+    card_type = ifelse(is.na(card_type), "nonbuyers", "buyers"),
+    client_age = as.numeric(difftime('1999-01-01', birthday, units = "days")) / 365.0,
+    account_age = as.numeric(difftime('1999-01-01', account_date, units = "days")) / 365.0
+  ) %>%
+  dplyr::select(-c(account_id, loan_id, loan_amount, loan_duration, loan_payments, loan_status, loan_date, loan_age, card_issued, card_age, birthday, account_date))
+df <- df[, 2:ncol(df)]
+
+# Round 'client_age' and 'account_age' to 1 decimal place
+df$client_age <- round(df$client_age, 1)
+df$account_age <- round(df$account_age, 1)
+
+# Count NAs of incomplete columns
+col_with_na <- df[, colSums(is.na(df)) != 0]
+colSums(is.na(col_with_na))
+```
+These 6 columns have numeric data. They represent the order amount of accounts. 
+NAs indicate the order amount = 0.
+So here I will replace the NAs with 0
+
+```{r}
+df[is.na(df)] <- 0
+cat( "There are", sum(is.na(df)), "NAs in data df.\n")
+cat("Number of Rows:", dim(df)[1], "\n")
+cat("Number of Columns:", dim(df)[2], "\n","Data size is moderate.")
+```
+```{r}
+print(head(df))
+```
+```{r}
+colnames(df)
+```
+
+In summary, available variables could be categoried as following:
+- Information of account owner: gender, birthday, age, residential district
+- Info of account: start date, account age, number of clients under the account_id
+- detailed information of residential district
+- permanant order amount by order types
+- transaction: 12-month-rollup statistical variables 
+- asset: 12-month-rollup statistical variables 
+
+### 1.8 Partition the data into training, validation and test data.
+I will split the dataset into three parts to prevent data leakage: 
+  - Training set: used to train the predictive model.
+  - Validation set: used for model fine-tuning and hyperparameter selection. 
+  - Test set: used to evaluate the final performance. 
+To prevent the dependency on how train test are splitted, I will use 10-fold cross-validation in the modeling part to enhance the robustness of the model.
+
+```{r}
+set.seed(267) 
+
+df$card_type <- factor(df$card_type, levels = c("nonbuyers", "buyers"))
+# create stratified training and temp sets
+index_train <- createDataPartition(df$card_type, p = 0.8, list = FALSE)
+
+# keep a copy of test set with client_id for later Top-N clients.
+# drop client_id for both train and testset, as it is not relevant to modeling.
+df_train <- df[index_train, ] %>% select(-client_id)
+df_test_clientid <- df[-index_train, ] 
+df_test <- df_test_clientid %>% select(-client_id)
+```
+
+
+## 2 Classify the data by machine learning algorithms
+### 2.1 Baseline model: logistic regression
+
+I will use logistic regression model as a baseline. Logistic regression requires numeric input variables. Therefore, I will first transform the non-numeric variables into numeric format. 
+
+```{r}
+unique_data_types <- unique(sapply(df, class))
+cat("Data types of df:", paste(unique_data_types, collapse = ", "))
+```
+
+```{r}
+cat_col <- colnames(df %>% select_if(is.character))
+cat("Categorical variables and number of unique categories:\n")
+sapply(df[, cat_col], function(col) length(unique(col)))
+```
+Categorical variables must be encoded for logistic regression. 
+I will convert the binary features (card_type, gender, loan_issuance) directly to integer 1 and 0. For the multi-class features (district_name, region, account_freq), I will apply one-hot encoding to categorical features to avoid assigning the converted number any ordinal meanings.
+
+There are 77 unique categories of district_name, this means, 77 columns will be generated by one-hot-encoding the feature district_name. In total, we will get more than 140 featuers. Depending on the machine learning selection, this might be not problematic. Tree-type models like decision tree and random forest could set tree depth to limit the usage of variables. Logistic regression could use regularization (e.g. L1) to automatically select relevant features and set others as 0. 
+
+#### 2.1.1 One hot encoding the categorical variables 
+```{r}
+df_encoded <- df %>%
+  mutate(gender = ifelse(gender == "male", 1, 0),
+         loan_issuance = ifelse(loan_issuance == "Yes", 1, 0))
+
+df_encoded$card_type <- factor(df_encoded$card_type, levels = c("nonbuyers", "buyers"))
+#encode the categorical variables
+encoded_df <- data.frame(model.matrix(~ 0 + ., data = df_encoded[, c("district_name", "region", "account_freq")]))
+
+# remove categorical variables
+df_ <- df_encoded[, -which(names(df_encoded) %in% c("district_name", "region", "account_freq"))]
+# full data with encoded categorical variables
+df_encoded <- cbind(df_, encoded_df)
+df_encoded
+```
+
+After One-hot-encoding, the data includes 143 independent features.
+
+#### 2.1.2 split encoded dataframe to train and testset
+```{r}
+# drop client_id in both train and test set.
+df_train_encoded <- df_encoded[index_train,] %>% select(-client_id)
+df_test_encoded <- df_encoded[-index_train,] %>% select(-client_id)
+df_test_encoded$card_type <- factor(df_test_encoded$card_type, levels = levels(df_train_encoded$card_type))
+x_train_encoded <- df_train_encoded %>% select(-(card_type))
+x_test_encoded <- df_test_encoded %>% select(-(card_type))
+```
+
+Split train and test dataset using same data indices as for the original data partitioning. So that it is comparable with later models.
+
+#### 2.1.3 add class weights to the model
+As previously already analysed, the dataset is imbalanced, if directly using imbalanced dataset for classification may result bias toward the majority class, causing poor predictions for the minority class.
+```{r}
+total_samples <- length(df_train$card_type)
+n_buyers = length(df_train$card_type[df_train$card_type == 'buyers'])
+n_nonbuyers = total_samples - n_buyers
+weight_buyers <- total_samples / (2 * n_buyers)
+weight_nonbuyers <- total_samples/ (2 * n_nonbuyers)
+cat("There are ",n_buyers,"buyers,", n_nonbuyers, "nonbuyers\n")
+cat("Weights of buyers:", weight_buyers, "\n")
+cat("Weights of non-buyers:", weight_nonbuyers, "\n")
+class_weights <- ifelse(df_train$card_type == 'buyers', weight_buyers, weight_nonbuyers)
+```
+
+#### 2.1.4 train logistic regression model with 10-fold cross validation
+```{r}
+ctrl <- trainControl(
+  method = "cv", 
+  number = 10, 
+  summaryFunction = twoClassSummary, 
+  classProbs = TRUE)
+lr_model <- train(x= x_train_encoded, 
+                   y = df_train_encoded$card_type, 
+                   method = "glm", trControl = ctrl, metric = "ROC", 
+                   maxit = 10000,weights = class_weights)
+```
+the warning suggests some of the variables are highly correlated with others and may contribute to multicollinearity. So I will identify these variables and drop them.
+
+#### 2.1.5 drop the highly correlated variables to solve multicollinearity
+
+My method is to find out the eigenvalues that are close to zero or significantly smaller than the others. These low eigenvalues indicate that the corresponding PCs (variables) are highly correlated with others and may be contributing to multicollinearity. Variables with low eigenvalues contribute less to explaining the variance in the data and are less informative. As a result, they may be more likely to overlap in terms of the information they provide, leading to multicollinearity.
+
+```{r, echo=FALSE, message=FALSE}
+# Calculate the correlation matrix
+correlation_matrix <- cor(df_train_encoded[,2:143])
+# Perform PCA
+pca_result <- princomp(correlation_matrix)
+eigenvalues <- pca_result$sdev^2
+variable_names <- rownames(pca_result$loadings)
+threshold <- 0.012  # Adjust this threshold as needed
+indices_close_to_0 <- which(abs(eigenvalues) < threshold)
+drop_variable_names<- variable_names[indices_close_to_0]
+df_train_encoded_reduced <- df_train_encoded %>% select(-drop_variable_names)
+df_train_encoded_reduced$card_type <- factor(df_train_encoded_reduced$card_type, levels = c("nonbuyers", "buyers"), ordered = TRUE)
+x_train_encoded_reduced <- x_train_encoded %>% select(-drop_variable_names)
+
+df_test_encoded_reduced <- df_test_encoded %>% select(-drop_variable_names)
+df_test_encoded_reduced$card_type <- factor(df_test_encoded_reduced$card_type, levels = c("nonbuyers", "buyers"), ordered = TRUE)
+x_test_encoded_reduced <- x_test_encoded %>% select(-drop_variable_names)
+```
+
+
+#### 2.1.6 Scale the data 
+
+It is a common preprocessing step in machine learning, including logistic regression, to ensure that all features have the same scale and contribute equally to the model's performance. 
+
+```{r}
+# Define the preprocessing method (scaling to [0, 1])
+preprocess_method <- preProcess(df_train_encoded_reduced, method = c("range"))
+# Apply the preprocessing method to both the training and test sets
+df_train_encoded_reduced_scaled <- predict(preprocess_method, df_train_encoded_reduced)
+df_test_encoded_reduced_scaled <- predict(preprocess_method, df_test_encoded_reduced)
+x_train_encoded_reduced_scaled <- df_train_encoded_reduced_scaled[,-which(names(df_train_encoded_reduced_scaled) == "card_type")]
+x_test_encoded_reduced_scaled <- df_test_encoded_reduced_scaled[,-which(names(df_test_encoded_reduced_scaled) == "card_type")]
+```
+
+
+#### 2.1.7 train logistic regression on the scaled data 
+
+##### 2.1.7.1 function to calculate metrics for the prediction results of each model
+
+```{r}
+metrics_table <- function(pred_labels, true_labels, idx, return_conf_matrix = FALSE){
+  expected_levels <- c("nonbuyers", "buyers")
+  pred_labels <- factor(pred_labels, levels = expected_levels)
+  true_labels <- factor(true_labels, levels = expected_levels)
+  conf_matrix <- confusionMatrix(pred_labels, true_labels, positive = 'buyers')
+  true_int <- ifelse(true_labels == 'nonbuyers', 0, 1)
+  pred_int <- ifelse(pred_labels == 'nonbuyers', 0, 1)
+  
+  TP <- conf_matrix$table['buyers','buyers']  # True Positives
+  TN <- conf_matrix$table['nonbuyers','nonbuyers'] # True Negatives
+  FP <- conf_matrix$table['buyers','nonbuyers']  # False Positives
+  FN <- conf_matrix$table['nonbuyers','buyers'] # False Negatives
+  roc_obj <- roc(true_int, pred_int)
+  AuC <- auc(roc_obj)
+
+  result <- data.frame(
+    model_index = idx,
+    f1_score = conf_matrix$byClass["F1"],
+    accuracy = conf_matrix$overall["Accuracy"],
+    AuC = AuC,
+    kohenkappa = conf_matrix$overall["Kappa"],
+    precision = conf_matrix$byClass["Pos Pred Value"],
+    recall = conf_matrix$byClass["Sensitivity"])
+  if(return_conf_matrix){
+    return(as.data.frame(conf_matrix$table))
+  }
+  else{
+    return(result)}}
+```
+
+
+##### 2.1.7.2 hyperparameter tuning
+
+```{r, echo=FALSE, message=FALSE}
+# Define the hyperparameter grid
+hyper_grid <- expand.grid(
+  alpha = c(0, 1),
+  lambda = c(0, 0.0001, 0.001, 0.01, 0.1),
+  iters = c(1000, 5000, 20000))
+
+lr_results_train <- data.frame()
+lr_results_test <- data.frame()
+lr_models_list <- list()
+lr_predictions_test_list <- list()
+
+# Perform grid search
+for (i in 1:nrow(hyper_grid)) {
+  alpha <- hyper_grid$alpha[i]
+  lambda <- hyper_grid$lambda[i]
+  iters <- hyper_grid$iters[i]
+  
+  control <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+# train logistic regression model
+  set.seed(123) 
+  lr_model <- train(
+    x = x_train_encoded_reduced_scaled,
+    y = df_train_encoded_reduced_scaled$card_type,
+    weights = class_weights,
+    method = "glmnet",
+    trControl = control,
+    metric = "ROC",
+    maxit = iters,
+    tuneGrid = expand.grid(
+      alpha = alpha,
+      lambda = lambda))
+  lr_models_list[[i]] <- lr_model
+  
+  # Evaluate model optimization  
+  train_predictions <- predict(lr_model, df_train_encoded_reduced_scaled, type = "prob")
+  #train_predictions <- as.data.frame(train_predictions)
+  train_predictions$decision <- as.factor(ifelse(train_predictions$nonbuyers > train_predictions$buyers, 'nonbuyers', 'buyers'))
+  result = metrics_table(train_predictions$decision, df_train_encoded_reduced_scaled$card_type, i)
+  lr_results_train <- rbind(lr_results_train, result)
+  
+  # Evaluate model on testset
+  test_predictions <- predict(lr_model, df_test_encoded_reduced_scaled, type = "prob")
+  test_predictions <- cbind(test_predictions, df_test_clientid) %>% select(c(buyers, client_id))%>% mutate(idx = 1:nrow(test_predictions), decision = as.factor(ifelse(buyers >= 0.5, 'buyers', 'nonbuyers'))) 
+
+  lr_predictions_test_list[[i]] <- test_predictions
+  result = metrics_table(test_predictions$decision, df_test_encoded_reduced_scaled$card_type, i)
+  lr_results_test <- rbind(lr_results_test, result)}
+
+# bind train and test metrics
+colnames(lr_results_train) <- paste0(colnames(lr_results_train), "_train")
+colnames(lr_results_test) <- paste0(colnames(lr_results_test), "_test")
+lr_results <- cbind(lr_results_train, lr_results_test)
+lr_results <- na.omit(lr_results) %>% select(-model_index_test) %>%
+  arrange(desc(f1_score_test), desc(AuC_test), desc(accuracy_test), desc(kohenkappa_test))
+lr_results
+```
+With grid searching, I get evaluation results of 30 models. The data is sorted by testset f1-score, AuC, accuracy, and kohenkappa. The eighth model has the best performance.
+
+To better visualize the result, I will use line plots to visualize the upper table. Line plots are usually used to present trends. However, it's perfectly fine to use lines to connect points within rows to distinguish between groups and highlight relationships in the data, because it makes the visualization clearer. 
+
+```{r}
+metric_order <- c("f1_score_train","f1_score_test","AuC_train","AuC_test","accuracy_train","accuracy_test", "kohenkappa_train", "kohenkappa_test", "precision_train", "precision_test","recall_train","recall_test")
+eval_long <- lr_results %>%
+  pivot_longer(cols = all_of(metric_order), names_to = 'metrics', values_to = 'values')
+
+ggplot(eval_long, aes(x = factor(metrics, levels = metric_order), y = values, group = model_index_train)) +
+geom_line(aes(color = model_index_train)) +
+geom_point(aes(color = model_index_train)) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+xlab("") +
+ggtitle("Logistic regression: Evaluation with 10-fold Cross Validation")
+```
+
+Most of the lines in the plot have very similar values especially in the trainset, except one model with significant higher recall but lower accuracy AuC kohenkappa. 
+
+#### 2.1.8 best model and explain it
+
+Based on the table and line plot, I will focus on the top 6 models with largest metric values.
+
+Find the corresponding hyperparameters of the TOP 6 best models.
+```{r}
+idx <- lr_results[1:6,'model_index_train']
+top_6_parameters <- hyper_grid[idx,]
+top_6_parameters
+```
+
+Select the first one as the best logistic regression model and explain it.
+
+```{r}
+final_lr_model <- lr_models_list[[1]]
+# explain the model
+explainer_lr <- explain(final_lr_model, data = df_train_encoded_reduced_scaled, y=as.numeric(df_train_encoded_reduced_scaled$card_type), label='logistic regression model')
+```
+#### 2.1.9 Top-10 features
+
+Top 10 features by permutation importance ranking: 
+```{r}
+set.seed(123)
+pfi_lr <- model_parts(explainer_lr, type = "variable_importance", N = 1000)
+plot(pfi_lr[1:11,], show_boxplots = TRUE) + ggtitle("Logistic regression: Top 10 most important features")
+```
+The plot tells, when mixing up the values of one feature, how much will the model negatively affected. Larger changes indicating higher importance of this feature. For example, the feature order_UVER has the highest importance here. The model with original full features has the AuC of 0.565. When mixing up the values of order_UVER, the model AuC is reduced to 0.539, the difference is 0.026. 
+We could see that, only the top 5 features (order_UVER, order_SIPO, order_OTHER, nr_municipalities_4, nr_enterpreneurs_per_1000_inhabitants) have valid importance/influence/contribution to the model performance. The top 6 to 10 features have almost null influence.
+
+
+#### 2.1.10 Top-10 clients
+
+Let's observe the top 10 clients with the highest prediction probabilities.
+
+```{r}
+final_lr_predictions_test <- lr_predictions_test_list[[idx[1]]] 
+Top_n_clients_lr <- final_lr_predictions_test %>% arrange(desc(buyers))
+Top_n_clients_lr
+```
+Overall, the prediction probabilities are not that high, with a maximal of 0.7.
+
+Check exactly which features contributed to the predictions.
+```{r}
+n = 10
+plot_list <- list()
+for (i in seq(1, n)) {
+  idx = Top_n_clients_lr[i,3]
+  client_id = Top_n_clients_lr[i,2]
+  bdp_lr <- predict_parts(explainer_lr, new_observation = df_test_encoded_reduced_scaled[idx, ])
+  p <- plot(bdp_lr) + ggtitle(paste("Logistic regression - Client_id ",client_id))
+  plot_list[[i]] <- p}
+
+for (i in 1:n) {
+  print(plot_list[[i]])
+}
+```
+
+In all top 10 clients, the features order_SIPO, order_UVER, order_OTHER are the main contributors.
+
+#### 2.1.11 Evaluation
+
+```{r, echo=FALSE, message=FALSE}
+metric_results <- data.frame()
+lr_result <- metrics_table(final_lr_predictions_test$decision, df_test_encoded_reduced_scaled$card_type, 'Logistic regression')
+metric_results <- rbind(lr_result, metric_results)
+```
+
+Receiver Operating Characteristic curve (ROC) 
+```{r, echo=FALSE, message=FALSE}
+plot_roc_auc <- function(model_pred_test, model_title) {
+  combined_df <- cbind(model_pred_test, df_test) %>% select(buyers, card_type)
+  combined_df$card_type <- factor(combined_df$card_type, levels = c("buyers", "nonbuyers"))
+  roc_obj <- roc(response = combined_df$card_type, predictor = combined_df$buyers)
+  model_test_auc <- auc(roc_obj)
+  model_test_roc <- roc_curve(combined_df, truth = card_type, buyers)
+  ggplot(data = model_test_roc, aes(x = 1 - specificity, y = sensitivity)) +
+    geom_path() +
+    geom_abline(linetype = "dashed") +
+    labs(title = model_title,
+         subtitle = paste0("AUC = ", round(model_test_auc, 2))) +
+    xlab("False Positive Rate (FPR)") +
+    ylab("True Positive Rate (TPR)") +
+    coord_equal()}
+
+plot_roc_auc(final_lr_predictions_test, "Logistic regression: ROC")
+```
+
+The x-axis FPR of ROC represents false positive rate, and the y-axis TPR for true positive rate.
+
+The AUC measures the area underneath the entire ROC curve from (0,0) to (1,1). It is an aggregate measure of the model's performance across all classification thresholds. An AUC of 0.5 suggests no discriminative power and an AUC of 1.0 represents perfect prediction.
+
+In my ROC graph, the AUC is 0.53, which suggests that the logistic regression model is performing only slightly better than random guessing for the given task.
+
+```{r, echo=FALSE, message=FALSE}
+conf_matrix <- metrics_table(final_lr_predictions_test$decision, df_test_encoded_reduced_scaled$card_type, 'logistic regression', return_conf_matrix=TRUE)
+ggplot(conf_matrix, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction", title = "Logistic regression: Confusion matrix") 
+```
+The confusion matrix tells, over half of the buyers (81 of 149) are false predicted as nonbuyers. Predictions on nonbuyers are slightly better, 257 of 750 nonbuyers are false predicted as buyers.
+
+```{r}
+metric_results
+```
+
+The best logistic regression has weak performance, indicating the relationship between the log odds of the dependent variable (buyers or nonbuyers) and the independent variables is not linear.
+
+### 2.2 Decision tree
+
+#### 2.2.1 train and tune hyperparameters 
+
+Decision tree could handle categorical data and unscaled data, so i will use the original not-encoded data with the same data spliting indices.
+```{r, echo=FALSE, message=FALSE}
+library(rpart)
+
+# Define the hyperparameter grid for grid search
+hyper_grid <- expand.grid(
+  minsplit = c(10, 20, 40),
+  minbucket = c(3, 7, 12),
+  maxdepth = c(3, 5, 10),
+  cp = c(0.01, 0.1, 0.5))
+
+tree_results_train <- data.frame()
+tree_results_test <- data.frame()
+tree_models_list <- list()
+tree_predictions_test_list <- list()
+# Perform grid search
+for (i in 1:nrow(hyper_grid)) {
+  control <- rpart.control(
+    minsplit = hyper_grid$minsplit[i],
+    minbucket = hyper_grid$minbucket[i],
+    maxdepth = hyper_grid$maxdepth[i],
+    cp = hyper_grid$cp[i],
+    method='cv', 
+    number=10,
+    weights = class_weights)
+  set.seed(123) 
+  tree_model <- rpart(
+    card_type ~ .,
+    data = df_train,
+    method = "class",
+    control = control)
+  tree_models_list[[i]] <- tree_model
+  # Evaluate model optimization  
+  train_predictions <- predict(tree_model, df_train, type = "prob")
+  train_predictions <- as.data.frame(train_predictions)
+  train_predictions$decision <- as.factor(ifelse(train_predictions$nonbuyers > train_predictions$buyers, 'nonbuyers', 'buyers'))
+  
+  result = metrics_table(train_predictions$decision, df_train$card_type, i)
+  tree_results_train <- rbind(tree_results_train, result)
+  
+  # Evaluate model on testset
+  test_predictions <- predict(tree_model, df_test, type = "prob")
+  test_predictions <- cbind(test_predictions, df_test_clientid) %>% select(c(buyers, client_id))%>% mutate(idx = 1:nrow(test_predictions), decision = as.factor(ifelse(buyers >= 0.5, 'buyers', 'nonbuyers'))) 
+
+  tree_predictions_test_list[[i]] <- test_predictions
+  result = metrics_table(test_predictions$decision, df_test$card_type, i)
+  tree_results_test <- rbind(tree_results_test, result)}
+
+# bind train and test metrics
+colnames(tree_results_train) <- paste0(colnames(tree_results_train), "_train")
+colnames(tree_results_test) <- paste0(colnames(tree_results_test), "_test")
+tree_results <- cbind(tree_results_train, tree_results_test)
+tree_results <- na.omit(tree_results) %>% select(-model_index_test) %>%
+  arrange(desc(f1_score_test), desc(AuC_test), desc(accuracy_test), desc(kohenkappa_test))
+tree_results
+```
+Visualize the result in lineplots, each line represents one model
+
+```{r}
+eval_long <- tree_results %>%
+  pivot_longer(cols = all_of(metric_order), names_to = 'metrics', values_to = 'values')
+
+ggplot(eval_long, aes(x = factor(metrics, levels = metric_order), y = values, group = model_index_train)) +
+geom_line(aes(color = model_index_train)) +
+geom_point(aes(color = model_index_train)) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+xlab("") +
+ggtitle("Decision tree: Evaluation with 10-fold Cross Validation")
+```
+
+The lines have very similar shape.
+The difference between train and test dataset is relatively large, because tree-type model is prone to overfitting.
+
+Check the corresponding hyperparameters of the TOP 6 best models.
+```{r}
+idx <- tree_results[1:6,'model_index_train']
+top_6_parameters <- hyper_grid[idx,]
+top_6_parameters
+```
+
+#### 2.2.2 best decision tree model and explain it
+
+Select the model with index 19 as the best tree model, and explain it.
+```{r}
+final_tree_model <- tree_models_list[[1]]
+# explainer
+explainer_tree <- explain(final_tree_model, data = df_train, y=as.numeric(df_train$card_type), label='tree model')
+```
+
+#### 2.2.3 Top-10 features: permuatation importance
+
+```{r}
+set.seed(123)
+pfi_tree <- model_parts(explainer_tree, type = "variable_importance", N = 1000)
+plot(pfi_tree[1:11,], show_boxplots = FALSE) + ggtitle("variable_importance", "")
+```
+All top 10 important features have visible influence on the model performance. The sad_trans has significant dominant influence comparing to other features.
+
+#### 2.2.4 Top-10 clients and feature contributions
+
+```{r}
+## Top-N clients
+final_tree_predictions_test <- tree_predictions_test_list[[idx[1]]] 
+Top_n_clients_tree <- final_tree_predictions_test %>% arrange(desc(buyers))
+Top_n_clients_tree
+```
+
+The top clients have very high predicted probabilities, even perfect.
+
+10 features that contributed most to each of the top-10 clients
+```{r}
+n = 10
+plot_list <- list()
+for (i in seq(1, n)) {
+  idx = Top_n_clients_tree[i,3]
+  client_id = Top_n_clients_tree[i,2]
+  bdp_tree <- predict_parts(explainer_tree, new_observation = df_test[idx, ])
+  p <- plot(bdp_tree) + ggtitle(paste("Decision tree - Client_id ",client_id))
+  plot_list[[i]] <- p}
+
+for (i in 1:n) {
+  print(plot_list[[i]])
+}
+```
+
+For each client of the top-10, maximal 6 features are contributing to the prediction result.
+
+#### 2.2.5 Evaluation
+```{r, echo=FALSE, message=FALSE}
+tree_result <- metrics_table(final_tree_predictions_test$decision, df_test$card_type, 'decision tree')
+metric_results <- rbind(tree_result, metric_results)
+plot_roc_auc(final_tree_predictions_test, "Decision tree: ROC")
+```
+
+AUC = 0.85 is relatively large, this means the decision tree prediction is much better than random guessing.
+
+```{r, echo=FALSE, message=FALSE}
+conf_matrix <- metrics_table(final_tree_predictions_test$decision, df_test$card_type, 'decision tree', return_conf_matrix=TRUE)
+ggplot(conf_matrix, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction", title = "Decision tree: Confusion matrix") 
+```
+The confusion matrix indicates, the model predicts better on nonbuyers group than the buyers group (weak recall).
+
+```{r}
+metric_results
+```
+
+The final decision tree model performs better than the baseline logistic regression model.
+
+### 2.3 Random forest
+
+#### 2.3.1 train model and tune hyperparameter 
+
+```{r, echo=FALSE, message=FALSE}
+# Define the hyperparameter grid for grid search
+hyper_grid <- expand.grid(
+  ntree = c(50, 100, 500, 1000),   # Number of trees in the forest.  
+  mtry = c(2, 4, 6),          # Number of variables randomly chosen at each split 
+  nodesize = c(5, 10, 20)     # Minimum size of terminal nodes 
+)
+
+forest_results_train <- data.frame()
+forest_results_test <- data.frame()
+forest_models_list <- list()
+forest_predictions_test_list <- list()
+
+for (i in 1:nrow(hyper_grid)) {
+  rf_params <- list(
+    ntree = hyper_grid$ntree[i],
+    mtry = hyper_grid$mtry[i],
+    nodesize = hyper_grid$nodesize[i])
+  
+  ctrl <- trainControl(
+    method = "cv",
+    number = 10, 
+    verboseIter = FALSE)
+  
+  # Train a Random Forest model with cross-validation
+  set.seed(123)
+  rf_model <- train(
+    card_type ~ .,
+    data = df_train,
+    weights = class_weights,
+    method = "rf",
+    trControl = ctrl,
+    tuneGrid = data.frame(mtry = rf_params$mtry),
+    ntree = rf_params$ntree,
+    nodesize = rf_params$nodesize)
+
+  forest_models_list[[i]] <- rf_model
+  # Make predictions and evaluations on the training set
+  train_predictions <- predict(rf_model, df_train)
+  result <- metrics_table(train_predictions, df_train$card_type, i)
+  forest_results_train <- rbind(forest_results_train, result)
+  
+  # Make predictions and evaluations on the test set
+  test_predictions <- predict(rf_model, df_test, type = "prob")
+  test_predictions <- cbind(test_predictions, df_test_clientid) %>% select(c(buyers, client_id))%>% mutate(idx = 1:nrow(test_predictions), decision = as.factor(ifelse(buyers >= 0.5, 'buyers', 'nonbuyers'))) 
+  forest_predictions_test_list[[i]] <- test_predictions
+  
+  result <- metrics_table(test_predictions$decision, df_test$card_type, i)
+  forest_results_test <- rbind(forest_results_test, result)}
+
+# bind train and test metrics
+colnames(forest_results_train) <- paste0(colnames(forest_results_train), "_train")
+colnames(forest_results_test) <- paste0(colnames(forest_results_test), "_test")
+forest_results <- cbind(forest_results_train, forest_results_test)
+forest_results <- na.omit(forest_results) %>% select(-model_index_test) %>%
+  arrange(desc(f1_score_test), desc(AuC_test), desc(accuracy_test), desc(kohenkappa_test))
+forest_results
+```
+
+```{r}
+eval_long <- forest_results %>%
+  pivot_longer(cols = all_of(metric_order), names_to = 'metrics', values_to = 'values')
+ggplot(eval_long, aes(x = factor(metrics, levels = metric_order), y = values, group = model_index_train)) +
+geom_line(aes(color = model_index_train)) +
+geom_point(aes(color = model_index_train)) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+xlab("") +
+ggtitle("Random forest: Evaluation with 10-fold Cross Validation")
+```
+We see two groups of lines from the plot. Comparing to decision tree, the difference between train and test dataset is smaller. This is because, random forest uses multiple number of decision tree models, to reduce overfitting.
+
+#### 2.3.2 best random forest 
+
+Check the exact parameters of the top 6 best random forest models.
+
+```{r}
+idx <- forest_results[1:6,'model_index_train']
+top_6_parameters <- hyper_grid[idx,]
+top_6_parameters
+```
+
+Best random forest model
+```{r}
+final_forest_model <- forest_models_list[[1]]
+# explainer
+explainer_forest <- explain(final_forest_model, data = df_train, y=as.numeric(df_train$card_type), label='random forest model')
+```
+ 
+#### 2.3.3 Top-10 features by permutation importance
+
+```{r}
+set.seed(123)
+pfi_forest <- model_parts(explainer_forest, type = "variable_importance", N = 1000)
+plot(pfi_forest[1:11,], show_boxplots = FALSE) + ggtitle("variable_importance", "")
+```
+The top 10 features are mainly the account_age, and statistics features of transaction and asset.
+The most important feature account_age has an influence factor of around 0.0008. This is very small comparing to upper two models. This means, the random forest model uses a long list of features candidates with similar importance, where the decision tree and logistic regression relied on only a few features. 
+
+#### 2.3.4 Top-10 clients
+```{r}
+final_forest_predictions_test <- forest_predictions_test_list[[idx[1]]] 
+Top_n_clients_forest <- final_forest_predictions_test %>% arrange(desc(buyers))
+Top_n_clients_forest
+```
+
+The probabilities are relatively good, but smaller than the decision tree.
+
+Features contribution analysis for top-10 clients
+```{r}
+n = 10
+plot_list <- list()
+for (i in seq(1, n)) {
+  idx = Top_n_clients_forest[i,3]
+  client_id = Top_n_clients_forest[i,2]
+  bdp_forest <- predict_parts(explainer_forest, new_observation = df_test[idx, ])
+  p <- plot(bdp_forest) + ggtitle(paste("Random forest - Client_id ",client_id))
+  plot_list[[i]] <- p}
+
+for (i in 1:n) {
+  print(plot_list[[i]])
+}
+```
+
+For each client, the top 10 contributed features have actually very similar strength of contribution. The all other features together have as well significant contribution. This tells, there are a long list of important features contribute to the final prediction of each client.
+
+#### 2.3.5 Evaluation
+
+AUC = 0.91, indicating a good prediction.
+```{r, echo=FALSE, message=FALSE}
+forest_result <- metrics_table(final_forest_predictions_test$decision, df_test$card_type, 'random forest')
+metric_results <- rbind(forest_result, metric_results)
+plot_roc_auc(final_forest_predictions_test, "Random forest: ROC")
+```
+Confusion matrix
+```{r, echo=FALSE, message=FALSE}
+conf_matrix <- metrics_table(final_forest_predictions_test$decision, df_test$card_type, 'random forest', return_conf_matrix=TRUE)
+ggplot(conf_matrix, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction", title = "Random forest: Confusion matrix") 
+```
+confusion matrix: The random forest could perfectly predict the nonbuyers group, but still over half of the buyers are false predicted as nonbuyers. This means, though with class_weights, the random forest could not perform that well on the minor group.
+
+```{r}
+metric_results
+```
+
+Over the evaluations of all six metrics on testset, random forest has much better performance than decision tree and logistic regression.
+
+
+
+### 2.4 Support vector machine (SVM)
+
+#### 2.4.1 train and tune hyperparameter
+```{r, echo=FALSE, message=FALSE}
+library(e1071)  # Load the 'e1071' package for SVM
+
+# Define the hyperparameter grid for grid search
+hyper_grid <- expand.grid(
+  C = c(0.01, 0.1, 1, 10),
+  kernel = c("linear", "radial", "polynomial", "sigmoid")
+)
+
+svm_results_train <- data.frame()
+svm_results_test <- data.frame()
+svm_models_list <- list()
+svm_predictions_test_list <- list()
+# Perform grid search for SVM
+for (i in 1:nrow(hyper_grid)) {
+  svm_model <- svm(
+    card_type ~ .,
+    data = df_train,
+    trControl = ctrl,
+    weights = class_weights,
+    type = "C-classification",
+    kernel = hyper_grid$kernel[i],
+    cost = hyper_grid$C[i],
+    scale = TRUE,  # Scale the data for better performance
+    probability = TRUE)
+  svm_models_list[[i]] <- svm_model
+  
+  # Evaluate model performance
+  train_predictions <- predict(svm_model, df_train)
+  result <- metrics_table(train_predictions, df_train$card_type, i)
+  svm_results_train <- rbind(svm_results_train, result)
+  
+  # Evaluate model on testset
+  test_predictions <- attr(predict(svm_model, df_test, probability=TRUE), "probabilities")
+  test_predictions <- cbind(test_predictions, df_test_clientid) %>% select(c(buyers, client_id))%>% mutate(idx = 1:nrow(test_predictions), decision = as.factor(ifelse(buyers >= 0.5, 'buyers', 'nonbuyers'))) 
+  svm_predictions_test_list[[i]] <- test_predictions
+  result = metrics_table(test_predictions$decision, df_test$card_type, i)
+  svm_results_test <- rbind(svm_results_test, result)
+}
+  
+# bind train and test metrics
+colnames(svm_results_train) <- paste0(colnames(svm_results_train), "_train")
+colnames(svm_results_test) <- paste0(colnames(svm_results_test), "_test")
+svm_results <- cbind(svm_results_train, svm_results_test)
+svm_results <- na.omit(svm_results) %>% select(-model_index_test) %>%
+  arrange(desc(f1_score_test), desc(AuC_test), desc(accuracy_test), desc(kohenkappa_test))
+svm_results
+```
+Visualize the evaluation result of tuning results.
+```{r}
+eval_long <- svm_results %>%
+  pivot_longer(cols = all_of(metric_order), names_to = 'metrics', values_to = 'values')
+
+ggplot(eval_long, aes(x = factor(metrics, levels = metric_order), y = values, group = model_index_train)) +
+geom_line(aes(color = model_index_train)) +
+geom_point(aes(color = model_index_train)) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+xlab("") +
+ggtitle("SVM: Evaluation with 10-fold Cross Validation")
+```
+
+A few models have larger metric values on testset than on trainset, which is a signal of underfitting.
+There is one model with significant higher values of all metrics than others and without underfitting sign.
+This should be the best model. But still I will check the hyperparameters of top 6 best models.
+
+#### 2.4.2 best model
+
+Find the corresponding hyperparameters of the TOP 6 best models.
+```{r}
+idx <- svm_results[1:6,'model_index_train']
+top_6_parameters <- hyper_grid[idx,]
+top_6_parameters
+```
+
+best SVM model and explain it
+```{r}
+final_svm_model <- svm_models_list[[1]]
+# explainer
+explainer_svm <- explain(final_svm_model, data = df_train, y=as.numeric(df_train$card_type), label='svm model')
+```
+
+#### 2.4.3 Top-10 important features
+
+```{r}
+set.seed(123)
+pfi_svm <- model_parts(explainer_svm, type = "variable_importance", N = 1000)
+plot(pfi_svm[1:11,], show_boxplots = FALSE) + ggtitle("SVM: Top 10 important features")
+```
+
+The top 10 important features in SVM model are the statistics of transaction and asset.
+The importance difference between the top 10 features are mild, but all are significant.
+The top 1 feature max_trans can influence model performance with almost 0.1, around three times large as the top 10 feature var_asset.
+
+
+#### 2.4.4 Top-10 clients
+```{r}
+final_svm_predictions_test <- svm_predictions_test_list[[idx[1]]] 
+Top_n_clients_svm <- final_svm_predictions_test %>% arrange(desc(buyers))
+Top_n_clients_svm
+```
+
+The predictions of top clients are very high and similar, almost perfect.
+
+#### 2.4.5 Evaluation
+
+```{r, echo=FALSE, message=FALSE}
+svm_result <- metrics_table(final_svm_predictions_test$decision, df_test$card_type, 'SVM')
+metric_results <- rbind(svm_result, metric_results)
+plot_roc_auc(final_forest_predictions_test, "SVM: ROC")
+```
+ROC graph indicating a good prediction as well.
+
+
+Plot confusion matrix
+```{r, echo=FALSE, message=FALSE}
+conf_matrix <- metrics_table(final_svm_predictions_test$decision, df_test$card_type, 'SVM', return_conf_matrix=TRUE)
+ggplot(conf_matrix, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction", title = "SVM: Confusion matrix") 
+```
+The SVM made much better prediction on buyers group than all other three models. This means, SVM could better handle imbalanced data.
+
+## 3 Compare the four models and identify the “best” model
+
+### 3.1 Compare the model performance
+```{r}
+metric_results
+```
+
+```{r}
+order <- c("f1_score","AuC", "accuracy","kohenkappa","precision","recall")
+metric_results$AuC <- as.numeric(metric_results$AuC)
+eval_long <- metric_results %>%
+  pivot_longer(cols = all_of(order), names_to = 'metrics', values_to = 'values')
+
+ggplot(eval_long, aes(x = factor(metrics, levels = order), y = values, group = model_index)) +
+  geom_line(aes(color = model_index)) +
+  geom_point(aes(color = model_index)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("") +
+  ggtitle("Comparison of four models")
+```
+Compare the evaluation metrics of four models:
+-   The performance ranking: SVM > random forest > decision tree >> logistic regression
+-   The SVM (Support Vector Machine) model has the best performance comparing to other three models, as it has the highest F1 score, accuracy, AuC, Cohen's kappa, recall, and second highest in precision. This possibly due to the SVM strengths: effective in high dimension space, less prone to overfitting, can handle imbalanced data.
+-   The random forest has as well very good performance, it is only slightly worse than SVM.
+-   Decision tree's performance is worse than random forest, as a single decision tree is prone to overfitting, even though it performs well on trainset, usually hard to generalize well on testset. Random forests reduce variance by averaging multiple deep decision trees, each trained on a different part of the same training set. This results in a more robust model that generalizes better to new data compared to a single decision tree.
+-   The logistic has much worse performance comparing to other three models. The reasons could be logistic regression models data with linear decision boundary. But in this dataset, the relationship between the dependent variable and independent variables is not linear but rather more complex interacted.
+
+### 3.2 Compare the top 5% and 10% clients for the baseline and 
+
+```{r}
+end_index_5 <- as.integer(nrow(df_test)*0.05)
+end_index_10 <- as.integer(nrow(df_test)*0.1)
+Top_5_clients_lr <- Top_n_clients_lr[1:end_index_5,]$client_id
+Top_10_clients_lr <- Top_n_clients_lr[1:end_index_10,]$client_id
+Top_5_clients_tree <- Top_n_clients_tree[1:end_index_5,]$client_id
+Top_10_clients_tree <- Top_n_clients_tree[1:end_index_10,]$client_id
+Top_5_clients_forest <- Top_n_clients_forest[1:end_index_5,]$client_id
+Top_10_clients_forest <- Top_n_clients_forest[1:end_index_10,]$client_id
+Top_5_clients_svm <- Top_n_clients_svm[1:end_index_5,]$client_id
+Top_10_clients_svm<- Top_n_clients_svm[1:end_index_10,]$client_id
+
+top5_lists<- c("Top_5_clients_lr","Top_5_clients_tree","Top_5_clients_forest","Top_5_clients_svm")
+top10_lists<- c("Top_10_clients_lr","Top_10_clients_tree","Top_10_clients_forest","Top_10_clients_svm")
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+# Function to calculate overlap percentage
+calculate_overlap <- function(list1, list2) {
+  common <- length(intersect(list1, list2))
+  unique_total <- length(unique(c(list1, list2)))
+  return (common / unique_total * 100)
+}
+
+top5_overlap_matrix <- matrix(nrow = 4, ncol = 4)
+top10_overlap_matrix <- matrix(nrow = 4, ncol = 4)
+
+for (i in 1:4) {
+  for (j in 1:4) {
+    if (i == j) {
+      top5_overlap_matrix[i, j] <- 100
+      top10_overlap_matrix[i, j] <- 100
+    } else {
+      top5_overlap_matrix[i, j] <- calculate_overlap(get(top5_lists[i]), get(top5_lists[j]))
+      top10_overlap_matrix[i, j] <- calculate_overlap(get(top10_lists[i]), get(top10_lists[j]))
+    }}}
+
+
+rownames(top5_overlap_matrix) <- colnames(top5_overlap_matrix) <- c("logistic regression", "decision tree", "random forest", "SVM")
+rownames(top10_overlap_matrix) <- colnames(top10_overlap_matrix) <- c("logistic regression", "decision tree", "random forest", "SVM")
+
+library(reshape2)
+# heatmap of overlapping of top 5% clients
+overlap_5 <- as.data.frame(top5_overlap_matrix)
+overlap_5$Model1 <- rownames(overlap_5)
+overlap_5 <- overlap_5 %>% gather(key='Model2', value='Overlap', -Model1)
+
+p1 <- ggplot(overlap_5, aes(x = Model1, y = Model2, fill = Overlap)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.1f%%", Overlap)), vjust = 1) +
+  scale_fill_gradient(low = "yellow", high = "red") +
+  theme_minimal() +
+  ggtitle("Top 5% clients: Overlap Heatmap") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank())
+
+# heatmap of overlapping of top 10% clients
+overlap_10 <- as.data.frame(top10_overlap_matrix)
+overlap_10$Model1 <- rownames(overlap_10)
+overlap_10 <- overlap_10 %>% gather(key='Model2', value='Overlap', -Model1)
+
+p2 <- ggplot(overlap_10, aes(x = Model1, y = Model2, fill = Overlap)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.1f%%", Overlap)), vjust = 1) +
+  scale_fill_gradient(low = "yellow", high = "red") +
+  theme_minimal() +
+  ggtitle("Top 10% clients: Overlap Heatmap") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank())
+
+grid.arrange(p1,p2,nrow=2,ncol=1)
+```
+-   The overlap percentage of top 10% clients lists between every two models are overall larger than top 5% clients.
+-   The overlap clients percentage between models SVM and random forest is largest in both heatmaps, it even reaches 61.8% in top 10% lists. This means, the two models share a more similar view on who are the top clients.
+-   The decision has slightly lower overlaps with random forest and SVM. 
+-   However, the logistic regression has overall very low overlapping clients with all other three models. This indicates that the features the logistic regression model uses for identifing top clients are quite different to decision tree, random forest, SVM models.
+
+
+Based on the performance and top clients overlaps, I will choose the **SVM model** as my final best model, as 
+-   it has the highest f1-score, accuray, AuC, recall, and second highest precision on unseen new test data.
+-   its predicted top clients are highly overlapped with random forest and decision tree models, this tells, its predictions criterias for identifying top clients are very likely reliable.
+
+
+## 4 Global importance of the “best” model and reduce the “best” model by balancing global importance and model performance.
+
+### 4.1 TOP-10 permuatation importance
+
+```{r}
+set.seed(123)
+pfi_svm <- model_parts(explainer_svm, type = "variable_importance", N = 1000)
+plot(pfi_svm[1:11,], show_boxplots = FALSE) + ggtitle("SVM: Top 10 important features")
+```
+
+max_trans appears to be the most important feature, followed by sad_trans, sad_asset, slope_trans, upper_quartile_trans, as the top-5. It seems transaction, asset, and account age are very important for classifying buyers and nonbuyers in this case.
+
+### 4.2 stepwise feature selection
+
+Gradually reduce the number of features based on their importance.
+Firstly, get the feature names sorted by importance in a vector.
+```{r}
+df_pfi_svm <- as.data.frame(pfi_svm) %>%
+  group_by(variable) %>%
+  summarise(mean_dropout_loss = mean(dropout_loss)) %>% arrange(mean_dropout_loss)%>% slice(2:60) 
+sorted_variables <- df_pfi_svm$variable
+```
+
+
+I will start with including only the top 10 important features for training and predicting the card types.
+Then including another 3 features in each step
+
+```{r, echo=FALSE, message=FALSE}
+# initialize with top 10 important features and target card_type
+n = 5 # include n features in each step
+selected_cols <- c('card_type', sorted_variables[1:10])
+cols_list <- list()
+svm_results_test_ <- data.frame()
+svm_models_list_ <- list()
+svm_predictions_test_list_ <- list()
+# Perform grid search for SVM
+for (i in 1:length(sorted_variables)) {
+  if (length(selected_cols) <= length(sorted_variables)+1){
+    cols_list[[i]] <- selected_cols
+    df_train_selected <- df_train[selected_cols]
+    df_test_selected <- df_test[selected_cols]
+    svm_model_ <- svm(
+      card_type ~ .,
+      data = df_train_selected,
+      trControl = ctrl,
+      weights = class_weights,
+      type = "C-classification",
+      kernel = "radial",
+      cost = 10.0,
+      scale = TRUE,  # Scale the data for better performance
+      probability = TRUE)
+    svm_models_list_[[i]] <- svm_model_
+    # Evaluate model on testset
+    test_predictions_ <- attr(predict(svm_model_, df_test_selected, probability=TRUE), "probabilities")
+    test_predictions_ <- cbind(test_predictions_, df_test_clientid) %>% select(c(buyers, client_id))%>% mutate(idx = 1:nrow(test_predictions_), decision = as.factor(ifelse(buyers >= 0.5, 'buyers', 'nonbuyers'))) 
+    svm_predictions_test_list_[[i]] <- test_predictions_
+    result = metrics_table(test_predictions_$decision, df_test_selected$card_type, i)
+    svm_results_test_ <- rbind(svm_results_test_, result)
+    # include another n variables
+    start_index = length(selected_cols)
+    if (start_index + n - 1 < length(sorted_variables)){
+      end_index = start_index + n - 1
+    }else {break}
+    selected_cols <- c(selected_cols, sorted_variables[start_index:end_index])
+  }else{break}
+}
+
+svm_results_test_ <- na.omit(svm_results_test_) %>%
+  arrange(desc(f1_score), desc(AuC), desc(accuracy), desc(kohenkappa))
+svm_results_test_
+```
+
+
+```{r}
+svm_results_test_$AuC <- as.numeric(svm_results_test_$AuC)
+df_long <- pivot_longer(svm_results_test_, cols = -model_index, names_to = "variable", values_to = "value")
+
+# Create the line plot
+ggplot(df_long, aes(x = model_index, y = value, color = variable)) +
+  geom_line() +
+  theme_minimal() +
+  labs(x = "Step (5 features per step)", y = "matric values", title = "Stepwise feature selection")
+```
+
+At the step 2, model has increased to largest of AuC, f1-score, kohenkappa, and recall. After this step, the metric values are decreased. This means, with the selected features at step 2, the SVM model performs best on testset: With less number of features (step 1), model is likely underfitting. With more number of features (step 3 till 10), model is more overfitting, therefore generalize worse on new data. 
+
+```{r}
+selected_features <- cols_list[[2]]
+selected_features
+```
+
+```{r}
+svm_2 <- rbind(svm_results_test_[1,],metric_results[1,])
+svm_2$model_index <- c("16 selected features","all features")
+svm_2
+```
+
+```{r}
+eval_long <- svm_2 %>%
+  pivot_longer(cols = -model_index, names_to = 'metrics', values_to = 'values')
+
+ggplot(eval_long, aes(x = factor(metrics), y = values, group = model_index)) +
+geom_line(aes(color = model_index)) +
+geom_point(aes(color = model_index)) +
+theme(axis.text.x = element_text(hjust = 1)) +
+xlab("") +
+ggtitle("Compare the effect of feature selection")
+```
+
+Stepwise feature selection has largely reduced the overfitting, and improved the model generalization. The model performance on unseen dataset is largely increased comparing to the model with all features.
+
+### 4.3 Final model: SVM with 16 features
+
+#### 4.3.1 confusion matrix
+
+```{r, echo=FALSE, message=FALSE}
+conf_matrix <- metrics_table(svm_predictions_test_list_[[2]]$decision, df_test$card_type, 'SVM', return_conf_matrix=TRUE)
+ggplot(conf_matrix, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction", title = "Final model: Confusion matrix") 
+```
+-   The final model could predict very well of nonbuyers group (19 out of 750 nonbuyers are false predicted as buyers), but predict is slightly worse on the buyers group (57 out of 149 true buyers are falsely predicted as nonbuyers).
+
+#### 4.3.2 Top clients
+
+Finally the top 5% clients with the highest potential:
+```{r, echo=FALSE, message=FALSE}
+predictions_test <- svm_predictions_test_list_[[2]] %>% arrange(desc(buyers))
+top_5_clients <-predictions_test[1:end_index_5,] %>% left_join(df_test_clientid, by = "client_id") %>% select(c("decision","card_type"))
+top_10_clients <-predictions_test[1:end_index_10,] %>% left_join(df_test_clientid, by = "client_id") %>% select(c("decision","card_type"))
+
+conf_matrix <- metrics_table(top_5_clients$decision, top_5_clients$card_type, 'SVM', return_conf_matrix=TRUE)
+p1 <- ggplot(conf_matrix, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction", title = "Top 5% clients: Confusion matrix") 
+conf_matrix <- metrics_table(top_10_clients$decision, top_10_clients$card_type, 'SVM', return_conf_matrix=TRUE)
+p2 <- ggplot(conf_matrix, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction", title = "Top 10% clients: Confusion matrix") 
+grid.arrange(p1,p2,nrow=1,ncol=2)
+```
+-   The top 5% clients list (44 clients) included only 1 true nonbuyers.
+-   The top 10% clients list (89 clients) included 7 true nonbuyers, this is worse than the top 5% clients prediction.
+-   The final model could predict the potential buyers very good. Prediction works especially good on the most top clients (e.g. 5%, or even less), when requiring larger number of potential buyers, the performance will slightly decrease. 
+
+
+Break down profile of the top 10 clients to understand the feature contributions in each case.
+
+```{r}
+final_model <- svm_models_list_[[2]]
+df_train_final <- df_train[selected_features]
+df_test_final <- df_test[selected_features]
+# explainer
+explainer_final <- explain(final_model, data = df_train_final, y=as.numeric(df_train_final$card_type), label='svm model')
+```
+```{r}
+n = 10
+plot_list <- list()
+for (i in seq(1, n)) {
+  idx = predictions_test[i,3]
+  client_id = predictions_test[i,2]
+  bdp_final <- predict_parts(explainer_final, new_observation = df_test_final[idx, ])
+  p <- plot(bdp_final) + ggtitle(paste("Break down profile - Client_id ",client_id))
+  plot_list[[i]] <- p}
+
+for (i in 1:n) {
+  print(plot_list[[i]])
+}
+```
+
+-   In the top 10 clients, the main contributed feature is either sad_trans, max_trans, or slope_trans.
+
+#### 4.3.3 features permutation importance
+
+```{r}
+set.seed(123)
+pfi_final <- model_parts(explainer_final, type = "variable_importance", N = 1000)
+plot(pfi_final, show_boxplots = FALSE) + ggtitle("Final SVM model: perfumation importance")
+```
+
+-   Similarly as previously (the SVM model with full features) shown, max_trans appeared to be the most important feature, with a significantly larger importance than others. This means, if the values of max_trans are mixed up, the model performance will be largely reduced.
+
+
+## 5 Describe result of the “final” model for the bank staff
+ 
+After analyzing the 12-month rollup information, my final model found the following factors as the most important ones for identifying potential credit card buyers. It will be helpful for the bank staff to efficiently selling credit cards as well as other bank products.
+
+**transaction** values and distribution: 
+  -   maximal transaction: largest single transaction a client has made. A high maximum transaction might suggest a customer who makes large investments or significant purchases and could be interested in credit card or other products for high-value transactions.
+  -   sum of absolute difference: it reflects how much a client's transactions go up and down. If this number is high, it means the customer's transaction amounts change a lot. This could indicate someone who has irregular income or expenses and might need flexible banking solutions.
+  -   slope: it tells if a client's transactions are generally increasing or decreasing over time. An increasing slope could mean the customer's financial activity is growing, potentially a good candidate for savings and investment products.
+  -   upper quartile: it gives an idea of the client's upper-range transaction amount. Customers with a high upper quartile might be more likely to buy premium banking products
+  -   median absolute deviation: it measures how varied a customer's transactions are. A high value may indicate a financial life with a lot of ups and downs.
+  -   number of transactions are above the mean: If a client often has transactions above their average, they might be experiencing growth or have variable income.
+  -   median: it's a good indicator of what a typical transaction looks like, which can help in understanding a client's usual financial behavior.
+  -   variance: it measures how much a customer's transactions differ from each other. A high variance means a lot of variability, possibly indicating a customer with unpredictable financial needs.
+  
+**asset:**
+  -   sum of absolute difference: similar to transactions, a high SAD of assets suggests the client's account balance changes frequently, indicating a dynamic financial situation.
+  -   robust trend: it indicates whether the client's assets are consistently increasing, decreasing, or staying about the same over time. A positive trend indicates signal financial growth, the client might be open to investment opportunities.
+  -   number of asset are positive: More positive records might indicate a stable or growing financial situation, suggesting they might be good candidates for additional financial products.
+  -   minimal value: it is the smallest amount the client has had in their account. It can help understand the customer's financial lows and possibly offer products that help of lower balances.
+  -   standard deviation: it tells how much a client's account balance varies. A client with a high standard deviation may need services in managing financial risk.
+  -   number of asset are above the mean: how often a customer's account balance is above their average balance. A large number indicates, the client might be a good prospect for savings or investment products due to their habit of maintaining higher balances.
+  
+**account_age:** how long the client has had this account with the bank. A longer account age could indicate loyalty and familiarity with the bank's services, and these clients might be more receptive to new offers.
+For the bank staff, these features provide clues about a customer's financial health and behavior. Understanding these can help in suggesting the right products to the customers, such as savings accounts, investment opportunities, financial planning services, or even special programs for those with high transaction volumes. 
+
